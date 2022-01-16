@@ -1,0 +1,567 @@
+!rm -rf tb_logs/my_model/*
+!pip install torch-scatter torch-sparse torch-cluster torch-spline-conv torch-geometric -f https://data.pyg.org/whl/torch-1.10.0+cu113.html
+!pip install pytorch-lightning 
+
+import torch
+from torch.nn import Sequential
+import torch_geometric
+from torch_geometric.datasets.shapenet import ShapeNet 
+from torch_geometric.utils import to_dense_batch
+from torch import nn
+from torch.nn import functional as F
+from torch.utils.data import random_split
+from torchvision import transforms
+import pytorch_lightning as pl
+from torch.autograd import Variable
+import numpy as np
+
+from torch.nn.modules.batchnorm import BatchNorm1d
+
+from torch_geometric.transforms import FixedPoints,KNNGraph, Compose, NormalizeScale
+
+from torch.nn.modules.batchnorm import BatchNorm1d
+
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import global_max_pool
+
+transform = Compose([FixedPoints(num=1024), NormalizeScale()])
+
+
+## **Load dataset**
+
+## FULL SET OF CATEGORIES
+'''
+train_dataset = ShapeNet(root='./datasets', split='train', include_normals=False, transform=transform, categories=['Airplane','Chair','Table','Lamp','Car','Motorbike','Mug'])
+val_dataset = ShapeNet(root='./datasets', split='val', include_normals=False, transform=transform, categories=['Airplane','Chair','Table','Lamp','Car','Motorbike','Mug'])
+test_dataset = ShapeNet(root='./datasets', split='test', include_normals=False, transform=transform, categories=['Airplane','Chair','Table','Lamp','Car','Motorbike','Mug'])
+'''
+
+## SINGLE CATEGORY
+#'''
+train_dataset = ShapeNet(root='./datasets', split='train', include_normals=False, transform=transform, categories=['Car'])
+val_dataset = ShapeNet(root='./datasets', split='val', include_normals=False, transform=transform, categories=['Car'])
+test_dataset = ShapeNet(root='./datasets', split='test', include_normals=False, transform=transform, categories=['Car'])
+#'''
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True,
+                              num_workers=1)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False,
+                         num_workers=1)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False,
+                         num_workers=1)
+
+## **(only run this section for testing on novel categories!)**
+
+### ONLY RUN THIS CELL FOR TESTING ON NOVEL CATEGORIES! ###
+
+# 7 NOVEL CATEGORIES
+#test_dataset = ShapeNet(root='./datasets', split='test', include_normals=False, transform=transform, categories=['Skateboard','Laptop','Bag','Cap','Pistol','Rocket','Earphone'])
+
+# ONE NOVEL CATEGORY
+test_dataset = ShapeNet(root='./datasets', split='test', include_normals=False, transform=transform, categories=['Skateboard'])
+
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True,
+                              num_workers=1)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False,
+                         num_workers=1)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False,
+                         num_workers=1)
+
+## **Autoencoder**
+
+class STN3d(nn.Module):
+    def __init__(self):
+        super(STN3d, self).__init__()
+        self.conv1 = torch.nn.Conv1d(3, 64, 1)
+        self.conv2 = torch.nn.Conv1d(64, 128, 1)
+        self.conv3 = torch.nn.Conv1d(128, 1024, 1)
+        self.fc1 = nn.Linear(1024, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, 9)
+        self.relu = nn.ReLU()
+
+        self.bn1 = nn.BatchNorm1d(64)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.bn3 = nn.BatchNorm1d(1024)
+        self.bn4 = nn.BatchNorm1d(512)
+        self.bn5 = nn.BatchNorm1d(256)
+
+
+    def forward(self, x):
+        batchsize = x.size()[0]
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = torch.max(x, 2, keepdim=True)[0] #(n_batch, 1024, n_points)
+        x = x.view(-1, 1024) #(n_batch_, 1024)
+
+        x = F.relu(self.bn4(self.fc1(x)))
+        x = F.relu(self.bn5(self.fc2(x)))
+        x = self.fc3(x)
+
+        iden = Variable(torch.from_numpy(np.array([1,0,0,0,1,0,0,0,1]).astype(np.float32))).view(1,9).repeat(batchsize,1)
+        if x.is_cuda:
+            iden = iden.cuda()
+        x = x + iden
+        x = x.view(-1, 3, 3)
+        return x
+
+
+class PointNetfeat(nn.Module):
+    def __init__(self, input_transform=False): #feature_transform: removed
+        super(PointNetfeat, self).__init__()
+        
+        if input_transform:
+            self.stn = STN3d()
+        else:
+            self.stn = None
+        
+        self.conv1 = torch.nn.Conv1d(3, 64, 1)
+        self.conv2 = torch.nn.Conv1d(64, 128, 1)
+        self.conv3 = torch.nn.Conv1d(128, 1024, 1)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.bn3 = nn.BatchNorm1d(1024)
+
+    def forward(self, x):
+        n_pts = x.size()[2]
+        
+        if self.stn:
+            trans = self.stn(x)
+            x = x.transpose(2, 1)
+            x = torch.bmm(x, trans)
+            x = x.transpose(2, 1)
+        
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.bn3(self.conv3(x))  # [batch_size, num_points, emb_size]
+        x = torch.max(x, 2, keepdim=True)[0]  # [batch_size, num_points, emb_size] ==> [batch_size, emb_size]
+        x = x.view(-1, 1024)
+        return x
+        
+
+class Decoder(nn.Module):
+    ''' Just a lightweight Fully Connected decoder:
+    '''
+
+    def __init__(self, num_points = 1024,code_size = 512): ### *** ###
+                super(Decoder, self).__init__()
+                self.num_points = num_points
+                self.fc1 = nn.Linear(code_size, 1024)
+                self.fc2 = nn.Linear(1024, 1024)
+                self.fc3 = nn.Linear(1024, self.num_points*3) #fc4 and fc5 removed
+                self.bn1 = nn.BatchNorm1d(1024)
+                self.bn2 = nn.BatchNorm1d(1024)
+                self.th = nn.Tanh()
+                
+    def forward(self, x):
+            batchsize = x.size()[0]
+            x = F.relu(self.bn1(self.fc1(x)))
+            x = F.relu(self.bn2(self.fc2(x)))
+            x = self.th(self.fc3(x))
+            x = x.view(batchsize, 3, self.num_points)
+            return x
+
+class LitAutoEncoder(pl.LightningModule):
+    def __init__(self, code_size=512, num_points=1024, input_transform=False):
+        super().__init__()
+        self.feat = PointNetfeat(input_transform=input_transform)
+
+        self.last_layer = torch.nn.Sequential(
+            nn.Linear(1024,code_size),
+            nn.BatchNorm1d(code_size),
+            nn.ReLU(),
+            )
+        self.decoder = Decoder(num_points=num_points,code_size=code_size)
+    
+    # Simple Chamfer Distance / Loss implementation
+    # Implementation from https://github.com/zztianzz/PF-Net-Point-Fractal-Network/blob/master/utils.py
+    # CVPR2020 Paper PF-Net: Point Fractal Network for 3D Point Cloud Completion.
+    def array2samples_distance(array1, array2):
+        """
+        arguments: 
+                array1: the array, size: (num_point, num_feature)
+                array2: the samples, size: (num_point, num_feature)
+        returns:
+                distances: each entry is the distance from a sample to array1 
+        """
+        num_point1, num_features1 = array1.shape
+        num_point2, num_features2 = array2.shape
+        expanded_array1 = array1.repeat(num_point2, 1)
+        expanded_array2 = torch.reshape(
+                        torch.unsqueeze(array2, 1).repeat(1, num_point1, 1),
+                        (-1, num_features2))
+        distances = (expanded_array1-expanded_array2)* (expanded_array1-expanded_array2)
+        #distances = torch.sqrt(distances)
+        distances = torch.sum(distances,dim=1)
+        distances = torch.reshape(distances, (num_point2, num_point1))
+        distances = torch.min(distances,dim=1)[0]
+        distances = torch.mean(distances)
+        return distances
+
+    def chamfer_distance(array1, array2):
+            batch_size, num_point, num_features = array1.shape
+            dist = 0
+            for i in range(batch_size):
+                    av_dist1 = LitAutoEncoder.array2samples_distance(array1[i], array2[i])
+                    av_dist2 = LitAutoEncoder.array2samples_distance(array2[i], array1[i])
+                    dist = dist + (0.5*av_dist1+0.5*av_dist2)/batch_size
+            return dist
+
+    def forward(self, x):
+        x = self.feat(x) # output is 1024 vector
+        code = self.last_layer(x)
+        points = self.decoder(code)
+        return points
+
+    # additional blocks required (PyTorch Lightning Module):
+    # https://www.pytorchlightning.ai/
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3) # The Lightning Module comes with Adams as standard
+        return optimizer
+
+    def training_step(self, train_batch, batch_idx):
+        x = train_batch.pos 
+        batch = train_batch.batch
+        x = torch.permute(to_dense_batch(x, batch)[0], (0,2,1))
+        x_hat = self.forward(x)
+        loss = LitAutoEncoder.chamfer_distance(x_hat, x)
+        self.log('train_loss', loss)
+        return loss
+
+    def validation_step(self, val_batch, batch_idx):
+        x = val_batch.pos 
+        batch = val_batch.batch
+        x = torch.permute(to_dense_batch(x, batch)[0], (0,2,1))
+        x_hat = self.forward(x)
+        loss = LitAutoEncoder.chamfer_distance(x_hat, x)
+        self.log('val_loss', loss)
+    
+    def test_step(self, test_batch, batch_idx):
+        x = test_batch.pos 
+        batch = test_batch.batch
+        x = torch.permute(to_dense_batch(x, batch)[0], (0,2,1))
+        x_hat = self.forward(x)
+        loss = LitAutoEncoder.chamfer_distance(x_hat, x)
+        self.log('test_loss', loss)
+
+# MODEL #
+model = LitAutoEncoder(input_transform=False)
+
+#'''
+print(model.feat)
+print(model.last_layer)
+print(model.decoder)
+#'''
+
+## **Training**
+
+n_epochs = 15
+
+trainer = pl.Trainer(max_epochs=n_epochs)
+
+# VISUALIZE RESULTS WITH TENSORBOARD #
+# https://www.tensorflow.org/tensorboard/
+
+from pytorch_lightning.loggers import TensorBoardLogger
+
+logger = TensorBoardLogger('tb_logs', name='my_model')
+trainer = pl.Trainer(
+    gpus=1,
+    logger=logger,
+    max_epochs=n_epochs
+)
+
+%reload_ext tensorboard
+%tensorboard --logdir tb_logs/
+
+trainer.fit(model, train_loader, val_loader)
+
+trainer.test(model=model,test_dataloaders=test_loader, ckpt_path=None)
+
+'''
+from google.colab import drive
+drive.mount('/content/drive')
+'''
+
+## **DYNAMIC EDGE CONVOLUTION**
+
+from torch_geometric.nn import DynamicEdgeConv
+
+class GraphEncoder(nn.Module):
+    
+    # Exploit Dynamic Edge Convolution:
+    # https://pytorch-geometric.readthedocs.io/en/latest/_modules/torch_geometric/nn/conv/edge_conv.html#DynamicEdgeConv
+
+    def __init__(self, k=3):
+        super().__init__()
+        '''
+        self.edgeconv1 = DynamicEdgeConv(torch.nn.Linear(3+3,32), k)
+        self.edgeconv2 = DynamicEdgeConv(torch.nn.Linear(32+32,32), k)
+        self.edgeconv3 = DynamicEdgeConv(torch.nn.Linear(32+32,32), k)
+        self.linear = torch.nn.Linear(32+32+32,1024)  
+        '''
+        # Reduced size #
+        self.edgeconv1 = DynamicEdgeConv(torch.nn.Linear(3+3,16), k)
+        self.edgeconv2 = DynamicEdgeConv(torch.nn.Linear(16+16,16), k)
+        #self.edgeconv3 = DynamicEdgeConv(torch.nn.Linear(32+32,32), k)
+        self.linear = torch.nn.Linear(16+16,256)      
+          
+    def forward(self, x, batch):
+        x1 = F.relu(self.edgeconv1(x))
+        x2 = F.relu(self.edgeconv2(x1))
+        #x3 = F.relu(self.edgeconv3(x2))
+        #x = torch.cat([x1,x2,x3],1)
+        x = torch.cat([x1,x2],1)
+        x = global_max_pool(x, batch)
+        x = self.linear(x)
+        return x
+
+class LitAutoEncoder2(pl.LightningModule):
+    def __init__(self, code_size=512, num_points=1024, k=5):
+        super().__init__()
+        self.feat = GraphEncoder(k=k)
+        self.last_layer = torch.nn.Sequential(
+            nn.Linear(256,code_size),
+            nn.BatchNorm1d(code_size),
+            nn.ReLU(),
+            )
+        self.decoder = Decoder(num_points=num_points,code_size=code_size, )
+    
+    def array2samples_distance(array1, array2):
+        """
+        arguments: 
+                array1: the array, size: (num_point, num_feature)
+                array2: the samples, size: (num_point, num_feature)
+        returns:
+                distances: each entry is the distance from a sample to array1 
+        """
+        num_point1, num_features1 = array1.shape
+        num_point2, num_features2 = array2.shape
+        expanded_array1 = array1.repeat(num_point2, 1)
+        expanded_array2 = torch.reshape(
+                        torch.unsqueeze(array2, 1).repeat(1, num_point1, 1),
+                        (-1, num_features2))
+        distances = (expanded_array1-expanded_array2)* (expanded_array1-expanded_array2)
+        #distances = torch.sqrt(distances)
+        distances = torch.sum(distances,dim=1)
+        distances = torch.reshape(distances, (num_point2, num_point1))
+        distances = torch.min(distances,dim=1)[0]
+        distances = torch.mean(distances)
+        return distances
+
+    def chamfer_distance(array1, array2):
+            batch_size, num_point, num_features = array1.shape
+            dist = 0
+            for i in range(batch_size):
+                    av_dist1 = LitAutoEncoder2.array2samples_distance(array1[i], array2[i])
+                    av_dist2 = LitAutoEncoder2.array2samples_distance(array2[i], array1[i])
+                    dist = dist + (0.5*av_dist1+0.5*av_dist2)/batch_size
+            return dist
+
+    def forward(self, x, batch):
+        x = self.feat(x, batch) # output is 1024 vector
+        code = self.last_layer(x)
+        points = self.decoder(code)
+        return points
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
+        return optimizer
+
+    def training_step(self, train_batch, batch_idx):
+        x = train_batch.pos 
+        batch = train_batch.batch
+        x_tr = torch.permute(to_dense_batch(x, batch)[0], (0,2,1))
+        x_hat = self.forward(x, batch)
+        loss = LitAutoEncoder2.chamfer_distance(x_hat, x_tr)
+        self.log('train_loss', loss)
+        return loss
+
+    def validation_step(self, val_batch, batch_idx):
+        x = val_batch.pos 
+        batch = val_batch.batch
+        x_tr = torch.permute(to_dense_batch(x, batch)[0], (0,2,1))
+        x_hat = self.forward(x, batch)
+        loss = LitAutoEncoder2.chamfer_distance(x_hat, x_tr)
+        self.log('val_loss', loss)
+
+    def test_step(self, test_batch, batch_idx):
+        x = test_batch.pos 
+        batch = test_batch.batch
+        x_tr = torch.permute(to_dense_batch(x, batch)[0], (0,2,1))
+        x_hat = self.forward(x, batch)
+        loss = LitAutoEncoder2.chamfer_distance(x_hat, x_tr)
+        self.log('test_loss', loss)
+
+model = LitAutoEncoder2()
+
+trainer = pl.Trainer(max_epochs=n_epochs)
+
+# VISUALIZE RESULTS WITH TENSORBOARD #
+# https://www.tensorflow.org/tensorboard/
+
+from pytorch_lightning.loggers import TensorBoardLogger
+
+logger = TensorBoardLogger('tb_logs', name='my_model')
+trainer = pl.Trainer(
+    gpus=1,
+    logger=logger,
+    max_epochs=n_epochs
+)
+
+%reload_ext tensorboard
+%tensorboard --logdir /content/tb_logs/my_model/version_3
+
+trainer.fit(model, train_loader, val_loader)
+
+trainer.test(model=model,test_dataloaders=test_loader, ckpt_path='/content/drive/MyDrive/Colab Notebooks/tb_logs_DGCNN_car_512/my_model/version_3/checkpoints/epoch=14-step=314.ckpt')
+
+## **RECONSTRUCTION**
+
+from torch_geometric.nn import DynamicEdgeConv
+import random
+
+def kNN(cloud, batch, M):
+    batch_size = torch.max(batch)+1
+    ret = []
+    for b in range(batch_size):
+        cloud_b = cloud[batch==b]
+        n_points, dims = cloud_b.shape
+        center_idx = random.randint(0, n_points-1)
+        center = cloud_b[center_idx, :]
+        center = center.expand((n_points, dims))
+      
+        # Computing euclidean distance
+        dist = cloud_b.add( - center).pow(2).sum(dim=1).pow(.5)
+      
+        # Getting the k neax_tr = torch.permute(to_dense_batch(x, batch)[0], (0,2,1))rest points
+        knn_indices = dist.topk(M, largest=False, sorted=False)[1]
+        mask = torch.ones(n_points).long()
+        mask[knn_indices] = 0
+        ret.append(mask)
+    
+    return torch.hstack(ret)
+
+class Decoder(nn.Module):
+    ''' Just a lightweight Fully Connected decoder:
+    '''
+
+    def __init__(self, num_points = 1024,code_size = 1024):
+                super(Decoder, self).__init__()
+                self.num_points = num_points
+                self.fc1 = nn.Linear(code_size, 1024)
+                self.fc2 = nn.Linear(1024, 1024)
+                self.fc3 = nn.Linear(1024, self.num_points*3)
+                self.bn1 = nn.BatchNorm1d(1024)
+                self.bn2 = nn.BatchNorm1d(1024)
+                self.th = nn.Tanh()
+                
+    def forward(self, x):
+            batchsize = x.size()[0]
+            x = F.relu(self.bn1(self.fc1(x)))
+            x = F.relu(self.bn2(self.fc2(x)))
+            x = self.th(self.fc3(x))
+            x = x.view(batchsize, 3, self.num_points)
+            return x
+
+class GraphEncoder(nn.Module):
+    def __init__(self, k=3, code_size=100):
+        super().__init__()
+        self.edgeconv1 = DynamicEdgeConv(torch.nn.Linear(3+3,16), k)
+        self.edgeconv2 = DynamicEdgeConv(torch.nn.Linear(16+16,16), k)
+        # self.edgeconv3 = DynamicEdgeConv(torch.nn.Linear(16+16,16), k)
+        self.linear = torch.nn.Linear(16+16,code_size)        
+    def forward(self, x, batch):
+        x1 = F.relu(self.edgeconv1(x))
+        x2 = F.relu(self.edgeconv2(x1))
+        x = torch.cat([x1,x2],1)
+        x = global_max_pool(x, batch)
+        x = self.linear(x)
+        return x
+
+class LitAutoEncoder3(pl.LightningModule):
+    def __init__(self, code_size=100, num_points=256, k=5, M=30):
+        super().__init__()
+        self.M = M
+        self.feat = GraphEncoder(k=k, code_size=code_size)
+        # self.last_layer = torch.nn.Sequential(
+        #     nn.Linear(256,code_size),
+        #     nn.BatchNorm1d(code_size),
+        #     nn.ReLU(),
+        #     )
+        self.decoder = Decoder(num_points=num_points,code_size=code_size, )
+    
+    def array2samples_distance(array1, array2):
+        """
+        arguments: 
+                array1: the array, size: (num_point, num_feature)
+                array2: the samples, size: (num_point, num_feature)
+        returns:
+                distances: each entry is the distance from a sample to array1 
+        """
+        num_point1, num_features1 = array1.shape
+        num_point2, num_features2 = array2.shape
+        expanded_array1 = array1.repeat(num_point2, 1)
+        expanded_array2 = torch.reshape(
+                        torch.unsqueeze(array2, 1).repeat(1, num_point1, 1),
+                        (-1, num_features2))
+        distances = (expanded_array1-expanded_array2)* (expanded_array1-expanded_array2)
+        #distances = torch.sqrt(distances)
+        distances = torch.sum(distances,dim=1)
+        distances = torch.reshape(distances, (num_point2, num_point1))
+        distances = torch.min(distances,dim=1)[0]
+        distances = torch.mean(distances)
+        return distances
+
+    def chamfer_distance(array1, array2):
+            batch_size, num_point, num_features = array1.shape
+            dist = 0
+            for i in range(batch_size):
+                    av_dist1 = LitAutoEncoder3.array2samples_distance(array1[i], array2[i])
+                    av_dist2 = LitAutoEncoder3.array2samples_distance(array2[i], array1[i])
+                    dist = dist + (0.5*av_dist1+0.5*av_dist2)/batch_size
+            return dist
+
+    def forward(self, x, batch):
+        x = self.feat(x, batch) # output is 1024 vector
+#         code = self.last_layer(x)
+        points = self.decoder(x)
+        return points
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
+        return optimizer
+
+    def training_step(self, train_batch, batch_idx):
+        x = train_batch.pos 
+        batch = train_batch.batch
+        mask = kNN(x, batch, self.M)
+        x_tr = torch.permute(to_dense_batch(x, batch)[0], (0,2,1))
+        x_hat = self.forward(x[mask!=0], batch[mask!=0])
+        loss = LitAutoEncoder3.chamfer_distance(x_hat, x_tr)
+        self.log('train_loss', loss)
+        return loss
+
+    def validation_step(self, val_batch, batch_idx):
+        x = val_batch.pos 
+        batch = val_batch.batch
+        mask = kNN(x, batch, self.M)
+        x_tr = torch.permute(to_dense_batch(x, batch)[0], (0,2,1))
+        x_hat = self.forward(x[mask!=0], batch[mask!=0])
+        loss = LitAutoEncoder3.chamfer_distance(x_hat, x_tr)
+        self.log('val_loss', loss)
+
+model = LitAutoEncoder3()
+
+trainer = pl.Trainer(max_epochs=10, gpus=1)
+
+trainer.fit(model, train_loader, val_loader)
+
+%reload_ext tensorboard
+%tensorboard --logdir /content/lightning_logs
+
+
+
